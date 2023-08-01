@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using Amazon.Lambda.Core;
 using Amazon.Lambda.S3Events;
@@ -14,15 +15,12 @@ namespace CsvProcessorLambda;
 
 public class Functions
 {
-    private readonly IAmazonS3 s3Client;
+    private static readonly IAmazonS3 s3Client = new AmazonS3Client();
 
     /// <summary>
     /// Default constructor that Lambda will invoke.
     /// </summary>
-    public Functions()
-    {
-        s3Client = new AmazonS3Client();
-    }
+    public Functions() { }
 
     public async Task FunctionHandler(S3Event evnt, ILambdaContext context)
     {
@@ -53,19 +51,30 @@ public class Functions
             )
             {
                 var records = csv.GetRecords<dynamic>().ToList();
-                foreach (var row in records)
+                var logMessages = new ConcurrentDictionary<int, string>();
+
+                Parallel.ForEach(records.Select((value, index) => new { index, value }), row =>
                 {
-                    var properties = ((IDictionary<string, object>)row).Select(
+                    var properties = ((IDictionary<string, object>)row.value).Select(
                         p => $"{p.Key}: {p.Value}"
                     );
                     string logMessage = string.Join(", ", properties);
-                    LambdaLogger.Log(logMessage);
+                    logMessages[row.index] = logMessage;
+                });
+
+                foreach (var index in logMessages.Keys.OrderBy(i => i))
+                {
+                    LambdaLogger.Log(logMessages[index]);
                 }
             }
         }
+        catch (AmazonS3Exception ex)
+        {
+            LambdaLogger.Log($"S3 Error: {ex.Message}");
+        }
         catch (Exception ex)
         {
-            LambdaLogger.Log($"Error: {ex.Message}");
+            LambdaLogger.Log($"General Error: {ex.Message}");
         }
     }
 }
