@@ -7,7 +7,7 @@ namespace CsvProcessorLambda;
 public class Startup
 {
     /// <summary>
-    /// Services for Lambda functions can be registered in the services dependency injection container in this method. 
+    /// Services for Lambda functions can be registered in the services dependency injection container in this method.
     ///
     /// The services can be injected into the Lambda function through the containing type's constructor or as a
     /// parameter in the Lambda function using the FromService attribute. Services injected for the constructor have
@@ -21,7 +21,7 @@ public class Startup
         //var builder = new ConfigurationBuilder()
         //                    .AddJsonFile("appsettings.json", true);
 
-        //// Add AWS Systems Manager as a potential provider for the configuration. This is 
+        //// Add AWS Systems Manager as a potential provider for the configuration. This is
         //// available with the Amazon.Extensions.Configuration.SystemsManager NuGet package.
         //builder.AddSystemsManager("/app/settings");
 
