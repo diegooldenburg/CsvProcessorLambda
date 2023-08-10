@@ -7,9 +7,7 @@ namespace CsvProcessorLambda.Tests;
 
 public class FunctionTest
 {
-    public FunctionTest()
-    {
-    }
+    public FunctionTest() { }
 
     // [Fact]
     // public void TestGetMethod()

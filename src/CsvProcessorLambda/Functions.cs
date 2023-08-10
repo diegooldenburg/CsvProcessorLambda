@@ -3,8 +3,10 @@ using Amazon.DynamoDBv2.Model;
 using Amazon.DynamoDBv2.DocumentModel;
 using Amazon.S3;
 using Amazon.S3.Model;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.S3Events;
 using CsvHelper;
-using Newtonsoft.Json;
+using Utf8Json;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -13,6 +15,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Xml;
+using System.Xml.Linq;
 using YamlDotNet.Serialization;
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
@@ -46,15 +49,42 @@ public class Functions
 
         var request = new GetItemRequest
         {
-            TableName = "YourTableName",
-            Key = new Dictionary<string, AttributeValue>() { { "FileName", new AttributeValue { S = s3FileName } } }
+            TableName = "CsvProcessingOptions",
+            Key = new Dictionary<string, AttributeValue>()
+            {
+                {
+                    "FileName",
+                    new AttributeValue { S = s3FileName }
+                }
+            }
         };
-        var response = await dynamoDBClient.GetItemAsync(request);
-        var options = Document.FromAttributeMap(response.Item);
 
-        var sortByOption = options["SortBy"].AsListOfDocument().Select(
-            doc => doc.ToDictionary(kvp => kvp.Key, kvp.Value.AsString())
-        ).ToList();
+        GetItemResponse dynamoResponse;
+        try
+        {
+            dynamoResponse = await dynamoDBClient.GetItemAsync(request);
+        }
+        catch (Exception ex)
+        {
+            LambdaLogger.Log($"Error retrieving item from DynamoDB: {ex.Message}");
+            return;
+        }
+
+        if (!dynamoResponse.IsItemSet)
+        {
+            LambdaLogger.Log($"No item found in DynamoDB for file name: {s3FileName}");
+            return;
+        }
+
+        var options = dynamoResponse.Item;
+
+        List<Dictionary<string, string>> sortByOption = null;
+        if (options.ContainsKey("SortBy") && options["SortBy"].IsLSet)
+        {
+            sortByOption = options["SortBy"].L
+                .Select(av => av.M.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.S))
+                .ToList();
+        }
 
         LambdaLogger.Log(bucketName);
         LambdaLogger.Log(s3FileName);
@@ -63,8 +93,10 @@ public class Functions
 
         try
         {
-            using (var response = await s3Client.GetObjectAsync(getObjectRequest))
-            using (var reader = new StreamReader(response.ResponseStream))
+            string output;
+
+            using (var s3Response = await s3Client.GetObjectAsync(getObjectRequest))
+            using (var reader = new StreamReader(s3Response.ResponseStream))
             using (
                 var csv = new CsvReader(
                     reader,
@@ -74,65 +106,74 @@ public class Functions
             {
                 var records = csv.GetRecords<dynamic>().ToList();
 
-                if (options["DropNull"].AsInt() == 1)
+                AttributeValue dropNull;
+                if (options.TryGetValue("DropNull", out dropNull) && dropNull.S != null)
                 {
-                    records = records.Where(r => !r.Values.Contains(null)).ToList();
+                    if (bool.Parse(dropNull.S))
+                    {
+                        records = records
+                            .Where(r => !((IDictionary<string, object>)r).Values.Contains(null))
+                            .ToList();
+                    }
                 }
 
-                foreach (var sortOption in sortByOption)
-                {
-                    var propertyName = sortOption["Type"];
-                    var order = sortOption["Order"];
-                    records = order == "ascending"
-                        ? records.OrderBy(r => r[propertyName]).ToList()
-                        : records.OrderByDescending(r => r[propertyName]).ToList();
-                }
-
-                switch (options["OutputType"].AsString())
+                switch (options["OutputType"].S)
                 {
                     case "json":
-                        output = JsonConvert.SerializeObject(records);
+                        output = Utf8Json.JsonSerializer.ToJsonString(records);
                         break;
                     case "xml":
-                        output = new XElement("Root",
-                            records.Select(i => new XElement("Record",
-                                i.Select(kv => new XElement(kv.Key, kv.Value))))).ToString();
+                        output = new XElement(
+                            "Root",
+                            records.Select(
+                                i =>
+                                    new XElement(
+                                        "Record",
+                                        ((IDictionary<string, object>)i).Select(
+                                            kv => new XElement(kv.Key, kv.Value)
+                                        )
+                                    )
+                            )
+                        ).ToString();
                         break;
                     case "yaml":
                         var serializer = new SerializerBuilder().Build();
                         output = serializer.Serialize(records);
                         break;
                     case "sql":
-                        output = "INSERT INTO YourTable (" + string.Join(", ", records.First().Keys) + ") VALUES " +
-                            string.Join(", ", records.Select(r => "(" + string.Join(", ", r.Values.Select(v => $"'{v}'")) + ")"));
+                        output =
+                            "INSERT INTO YourTable ("
+                            + string.Join(", ", records.First().Keys)
+                            + ") VALUES "
+                            + string.Join(
+                                ", ",
+                                records.Select(
+                                    r =>
+                                        "("
+                                        + string.Join(
+                                            ", ",
+                                            ((IDictionary<string, object>)r).Values.Select(
+                                                v => $"'{v}'"
+                                            )
+                                        )
+                                        + ")"
+                                )
+                            );
                         break;
                     default:
                         throw new Exception("Invalid OutputType option.");
                 }
 
-                // var putObjectRequest = new PutObjectRequest
-                // {
-                //     BucketName = bucketName,
-                //     Key = s3FileName + "." + options["OutputType"].AsString(),
-                //     ContentBody = output
-                // };
-                // await s3Client.PutObjectAsync(putObjectRequest);
-
-                var logMessages = new ConcurrentDictionary<int, string>();
-
-                Parallel.ForEach(records.Select((value, index) => new { index, value }), row =>
+                var putObjectRequest = new PutObjectRequest
                 {
-                    var properties = ((IDictionary<string, object>)row.value).Select(
-                        p => $"{p.Key}: {p.Value}"
-                    );
-                    string logMessage = string.Join(", ", properties);
-                    logMessages[row.index] = logMessage;
-                });
-
-                foreach (var index in logMessages.Keys.OrderBy(i => i))
-                {
-                    LambdaLogger.Log(logMessages[index]);
-                }
+                    BucketName = "processed-csv",
+                    Key =
+                        Path.GetFileNameWithoutExtension(s3FileName)
+                        + "."
+                        + options["OutputType"].S,
+                    ContentBody = output
+                };
+                await s3Client.PutObjectAsync(putObjectRequest);
             }
         }
         catch (AmazonS3Exception ex)
